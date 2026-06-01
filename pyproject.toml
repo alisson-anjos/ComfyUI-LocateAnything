@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-locateanything"
 description = "ComfyUI nodes for NVIDIA LocateAnything-3B visual grounding, detection, text localization, GUI grounding, and pointing."
-version = "0.1.1"
+version = "0.1.2"
 license = {file = "LICENSE"}
 dependencies = [
     "huggingface-hub>=0.36.0",

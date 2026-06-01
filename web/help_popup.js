@@ -55,16 +55,24 @@ const HELP_CONTENT = {
       <tr><td><code>temperature</code></td><td>Sampling randomness. Use 0 for deterministic grounding.</td></tr>
       <tr><td><code>top_p</code></td><td>Nucleus sampling cutoff. Relevant when temperature is above 0.</td></tr>
       <tr><td><code>repetition_penalty</code></td><td>Penalty for repeated tokens. The official worker uses 1.1.</td></tr>
-      <tr><td><code>point_radius</code></td><td>Radius in pixels used to draw points into the mask.</td></tr>
+      <tr><td><code>point_radius</code></td><td>Radius in pixels used to draw point results into the mask.</td></tr>
+      <tr><td><code>mask_grow</code></td><td>Grow rectangular or circular masks by this many pixels. Negative values shrink them.</td></tr>
+      <tr><td><code>mask_blur</code></td><td>Gaussian blur radius applied after grow. Use 0 for hard edges.</td></tr>
+      <tr><td><code>overlay_color</code></td><td>Hex RGB color for the overlay preview, such as <code>#00ff66</code> or <code>#ff0000</code>.</td></tr>
+      <tr><td><code>overlay_opacity</code></td><td>Opacity of the colored mask overlay preview.</td></tr>
+      <tr><td><code>seed</code></td><td>Sampling seed. Relevant when temperature is above 0. For IMAGE batches, frame N uses <code>seed + N</code> for reproducible frame-by-frame processing.</td></tr>
       <tr><td><code>verbose</code></td><td>Print the official step-by-step generation log in the terminal. Disable for quieter runs.</td></tr>
     </table>
+    <h3>Mask Geometry</h3>
+    <p>LocateAnything is a grounding model, not a segmentation model. Box results produce rectangular masks and point results produce circular masks. Grow and blur expand or soften those shapes; they do not extract an object silhouette. Use a segmentation node such as SAM downstream when silhouette masks are required.</p>
     <h3>Outputs</h3>
     <table>
       <tr><th>Output</th><th>Description</th></tr>
       <tr><td><code>answer</code></td><td>Raw model response. For batches, a JSON array.</td></tr>
       <tr><td><code>locations_json</code></td><td>Structured results with batch index, timing, normalized [0, 1000] coordinates, and pixel coordinates.</td></tr>
       <tr><td><code>annotated_image</code></td><td>Input frames with boxes and points drawn on them.</td></tr>
-      <tr><td><code>mask</code></td><td>Combined mask batch with filled boxes and circles centered on points.</td></tr>
+      <tr><td><code>mask</code></td><td>Post-processed rectangular box masks and circular point masks after grow and blur.</td></tr>
+      <tr><td><code>mask_overlay</code></td><td>Original frames with the post-processed mask blended using the selected color and opacity.</td></tr>
     </table>
   `,
   LocateAnythingUnloadModel: `

@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image, ImageDraw
 
 import folder_paths
@@ -229,6 +230,47 @@ def _draw_locations(
     return annotated, torch.from_numpy(mask)
 
 
+def _postprocess_mask(mask: torch.Tensor, grow: int, blur_radius: float) -> torch.Tensor:
+    output = mask.float().clamp(0, 1).unsqueeze(0).unsqueeze(0)
+    if grow != 0:
+        kernel_size = abs(grow) * 2 + 1
+        if grow > 0:
+            output = F.max_pool2d(output, kernel_size=kernel_size, stride=1, padding=abs(grow))
+        else:
+            output = 1.0 - F.max_pool2d(1.0 - output, kernel_size=kernel_size, stride=1, padding=abs(grow))
+
+    if blur_radius > 0:
+        radius = max(1, int(round(blur_radius * 3)))
+        coords = torch.arange(-radius, radius + 1, device=output.device, dtype=output.dtype)
+        kernel = torch.exp(-(coords**2) / (2 * blur_radius**2))
+        kernel = kernel / kernel.sum()
+        output = F.pad(output, (radius, radius, 0, 0), mode="replicate")
+        output = F.conv2d(output, kernel.view(1, 1, 1, -1))
+        output = F.pad(output, (0, 0, radius, radius), mode="replicate")
+        output = F.conv2d(output, kernel.view(1, 1, -1, 1))
+
+    return output.squeeze(0).squeeze(0).clamp(0, 1)
+
+
+def _parse_overlay_color(value: str) -> torch.Tensor:
+    color = value.strip().lstrip("#")
+    if len(color) == 3:
+        color = "".join(character * 2 for character in color)
+    if len(color) != 6 or not re.fullmatch(r"[0-9a-fA-F]{6}", color):
+        raise ValueError("overlay_color must be a hex RGB color such as #00ff66")
+    return torch.tensor([int(color[index : index + 2], 16) / 255.0 for index in (0, 2, 4)])
+
+
+def _make_mask_overlay(
+    image: torch.Tensor,
+    mask: torch.Tensor,
+    color: torch.Tensor,
+    opacity: float,
+) -> torch.Tensor:
+    alpha = mask.unsqueeze(-1) * opacity
+    return (image.detach().cpu().float().clamp(0, 1) * (1.0 - alpha) + color.view(1, 1, 3) * alpha).clamp(0, 1)
+
+
 def _json_default(value: Any) -> str:
     if isinstance(value, torch.Tensor):
         return f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype})"
@@ -254,6 +296,7 @@ class LocateAnythingRuntime:
         temperature: float,
         top_p: float,
         repetition_penalty: float,
+        seed: int,
         verbose: bool,
     ) -> dict[str, Any]:
         messages = [
@@ -279,21 +322,24 @@ class LocateAnythingRuntime:
         ).to(self.device)
 
         started = time.perf_counter()
-        response = self.model.generate(
-            pixel_values=inputs["pixel_values"].to(self.dtype),
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            image_grid_hws=inputs.get("image_grid_hws"),
-            tokenizer=self.tokenizer,
-            max_new_tokens=max_new_tokens,
-            use_cache=True,
-            generation_mode=generation_mode,
-            temperature=temperature,
-            do_sample=temperature > 0,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            verbose=verbose,
-        )
+        cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=cuda_devices):
+            torch.manual_seed(seed)
+            response = self.model.generate(
+                pixel_values=inputs["pixel_values"].to(self.dtype),
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                image_grid_hws=inputs.get("image_grid_hws"),
+                tokenizer=self.tokenizer,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+                generation_mode=generation_mode,
+                temperature=temperature,
+                do_sample=temperature > 0,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                verbose=verbose,
+            )
         elapsed = time.perf_counter() - started
 
         payload = response[0] if isinstance(response, tuple) else response
@@ -435,17 +481,23 @@ class LocateAnythingGrounding:
                     {"default": 1.1, "min": 0.0, "max": 3.0, "step": 0.05, "tooltip": "Penalty for repeated tokens. The official worker uses 1.1."},
                 ),
                 "point_radius": ("INT", {"default": 12, "min": 1, "max": 512, "tooltip": "Radius in pixels used to draw point results into the output mask."}),
+                "mask_grow": ("INT", {"default": 0, "min": -512, "max": 512, "step": 1, "tooltip": "Grow the output mask by this many pixels. Negative values shrink it."}),
+                "mask_blur": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1, "tooltip": "Gaussian blur radius applied after mask grow. Use 0 for hard edges."}),
+                "overlay_color": ("STRING", {"default": "#00ff66", "tooltip": "Hex RGB color used by the mask overlay preview, for example #00ff66 or #ff0000."}),
+                "overlay_opacity": ("FLOAT", {"default": 0.45, "min": 0.0, "max": 1.0, "step": 0.05, "tooltip": "Opacity of the colored mask overlay preview."}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff, "control_after_generate": True, "tooltip": "Sampling seed. Relevant when temperature is above 0. For IMAGE batches, frame N uses seed + N."}),
                 "verbose": ("BOOLEAN", {"default": True, "tooltip": "Print the official generation step log in the terminal. Disable for quieter runs."}),
             }
         }
 
-    RETURN_TYPES = ("STRING", "STRING", "IMAGE", "MASK")
-    RETURN_NAMES = ("answer", "locations_json", "annotated_image", "mask")
+    RETURN_TYPES = ("STRING", "STRING", "IMAGE", "MASK", "IMAGE")
+    RETURN_NAMES = ("answer", "locations_json", "annotated_image", "mask", "mask_overlay")
     OUTPUT_TOOLTIPS = (
         "Raw model response. For batches, this is a JSON array of responses.",
         "Structured JSON with prompt, timing, normalized coordinates, pixel coordinates, and batch index.",
         "Input image batch annotated with returned boxes and points.",
-        "Combined mask batch: filled boxes and circles centered on returned points.",
+        "Post-processed mask batch after grow and blur: filled boxes and circles centered on returned points.",
+        "Original image batch with the post-processed mask blended using overlay_color and overlay_opacity.",
     )
     FUNCTION = "run"
     CATEGORY = "LocateAnything"
@@ -476,6 +528,11 @@ Coordinates are parsed from the model's normalized [0, 1000] format. A batch of 
         top_p: float,
         repetition_penalty: float,
         point_radius: int,
+        mask_grow: int,
+        mask_blur: float,
+        overlay_color: str,
+        overlay_opacity: float,
+        seed: int,
         verbose: bool,
     ):
         prompt = _build_prompt(task, query)
@@ -483,9 +540,12 @@ Coordinates are parsed from the model's normalized [0, 1000] format. A batch of 
         records = []
         annotated_images = []
         masks = []
+        mask_overlays = []
+        color = _parse_overlay_color(overlay_color)
         progress_bar = comfy.utils.ProgressBar(len(image))
 
         for index, frame in enumerate(image):
+            frame_seed = (seed + index) & 0xffffffffffffffff
             pil_image = _tensor_to_pil(frame)
             result = model.predict(
                 image=pil_image,
@@ -495,10 +555,12 @@ Coordinates are parsed from the model's normalized [0, 1000] format. A batch of 
                 temperature=temperature,
                 top_p=top_p,
                 repetition_penalty=repetition_penalty,
+                seed=frame_seed,
                 verbose=verbose,
             )
             locations = parse_locations(result["answer"], *pil_image.size)
             annotated, mask = _draw_locations(pil_image, locations, point_radius)
+            mask = _postprocess_mask(mask, mask_grow, mask_blur)
             answers.append(result["answer"])
             records.append(
                 {
@@ -506,12 +568,14 @@ Coordinates are parsed from the model's normalized [0, 1000] format. A batch of 
                     "prompt": prompt,
                     "answer": result["answer"],
                     "elapsed_seconds": result["elapsed_seconds"],
+                    "seed": frame_seed,
                     "locations": locations,
                     "stats": result.get("stats"),
                 }
             )
             annotated_images.append(_pil_to_tensor(annotated))
             masks.append(mask)
+            mask_overlays.append(_make_mask_overlay(frame, mask, color, overlay_opacity))
             progress_bar.update_absolute(index + 1)
 
         answer = answers[0] if len(answers) == 1 else json.dumps(answers, ensure_ascii=False)
@@ -521,6 +585,7 @@ Coordinates are parsed from the model's normalized [0, 1000] format. A batch of 
             locations_json,
             torch.stack(annotated_images),
             torch.stack(masks),
+            torch.stack(mask_overlays),
         )
 
 

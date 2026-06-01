@@ -43,7 +43,8 @@ Outputs:
 | `answer` | Raw model response. For batches, a JSON array of responses. |
 | `locations_json` | Structured batch results with prompt, timing, normalized `[0, 1000]` coordinates, pixel coordinates, and `batch_index`. |
 | `annotated_image` | Input batch with returned boxes and points drawn on each frame. |
-| `mask` | Combined mask batch containing filled boxes and circles centered on returned points. |
+| `mask` | Post-processed mask batch containing rectangular box masks and circular point masks after grow and blur. |
+| `mask_overlay` | Original image or video frames with the post-processed mask blended using the selected color and opacity. |
 
 Task modes:
 
@@ -71,7 +72,14 @@ Generation parameters:
 | `top_p` | Nucleus sampling cutoff. Relevant when `temperature` is above `0`. |
 | `repetition_penalty` | Penalty for repeated tokens. The official worker uses `1.1`. |
 | `point_radius` | Radius in pixels used when points are drawn into the output mask. |
+| `mask_grow` | Grow rectangular or circular masks by this many pixels. Negative values shrink them. |
+| `mask_blur` | Gaussian blur radius applied after grow. Use `0` for hard edges. |
+| `overlay_color` | Hex RGB color used for the overlay preview, such as `#00ff66` or `#ff0000`. |
+| `overlay_opacity` | Opacity of the colored overlay preview. |
+| `seed` | Sampling seed. Relevant when `temperature` is above `0`. For batches, frame N uses `seed + N`. |
 | `verbose` | Prints the official step-by-step generation log in the terminal. Disable it for quieter runs. |
+
+Mask geometry note: LocateAnything is a grounding model, not a segmentation model. Boxes generate rectangular masks and points generate circular masks. `mask_grow` and `mask_blur` modify these shapes but do not extract object silhouettes. Connect a segmentation node such as SAM downstream when a contour mask is required.
 
 Generation modes:
 
