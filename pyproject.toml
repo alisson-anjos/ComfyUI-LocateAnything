@@ -1,0 +1,26 @@
+[project]
+name = "comfyui-locateanything"
+description = "ComfyUI nodes for NVIDIA LocateAnything-3B visual grounding, detection, text localization, GUI grounding, and pointing."
+version = "0.1.0"
+license = {file = "LICENSE"}
+dependencies = [
+    "huggingface-hub>=0.36.0",
+    "transformers>=4.57.1,<5",
+    "accelerate>=1.5.2",
+    "timm>=1.0.11",
+    "numpy>=1.25.0",
+    "Pillow>=11.1.0",
+]
+
+[project.urls]
+Repository = "https://github.com/alisson-anjos/ComfyUI-LocateAnything"
+Documentation = "https://github.com/alisson-anjos/ComfyUI-LocateAnything#readme"
+"Bug Tracker" = "https://github.com/alisson-anjos/ComfyUI-LocateAnything/issues"
+"Official Model" = "https://huggingface.co/nvidia/LocateAnything-3B"
+"Official Project" = "https://github.com/NVlabs/Eagle/tree/main/Embodied"
+
+[tool.comfy]
+PublisherId = "alisson-anjos"
+DisplayName = "ComfyUI-LocateAnything"
+Icon = ""
+includes = []
