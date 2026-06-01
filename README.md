@@ -34,7 +34,7 @@ The official checkpoint requires `trust_remote_code=True`. Loading it executes P
 
 ### LocateAnything Grounding
 
-Runs inference for every image in the connected batch. A video loaded as a ComfyUI `IMAGE` batch is processed frame by frame, with a native ComfyUI progress bar.
+Runs inference for every image in the connected batch. A video loaded as a ComfyUI `IMAGE` batch is processed frame by frame, with a native ComfyUI progress bar. The node includes a visible `?` icon in its title bar that opens an in-app parameter reference popup.
 
 Outputs:
 
@@ -57,7 +57,9 @@ Task modes:
 | `gui_box` | Locates a GUI region as a bounding box. |
 | `gui_point` | Returns a point for a GUI target. |
 | `point` | Returns a point for a described target. |
-| `custom` | Sends `query` as the complete model prompt. |
+| `custom` | Sends `query` as the complete model prompt. General visual questions may return plain text, but VQA is experimental because the checkpoint is optimized for localization. |
+
+In `custom` mode, a question such as `What is the color of the t-shirt?` may return a plain-text answer. When the response contains no coordinates, `annotated_image` remains unchanged and `mask` is empty. General VQA quality is not guaranteed by this grounding-focused checkpoint.
 
 Generation parameters:
 
