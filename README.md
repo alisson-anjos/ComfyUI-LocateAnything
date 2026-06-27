@@ -4,6 +4,8 @@ ComfyUI custom nodes for NVIDIA's [LocateAnything-3B](https://huggingface.co/nvi
 
 LocateAnything supports object detection, phrase grounding, text localization, document layout analysis, GUI grounding, and point-based localization. This integration processes ComfyUI `IMAGE` batches frame by frame and returns structured coordinates, annotated previews, and masks.
 
+This node also applies runtime compatibility patches for recent `transformers` releases and can use the optional upstream batch runtime shipped inside the Hugging Face model snapshot.
+
 ## Important Model License Notice
 
 This repository contains integration code only. Model weights are downloaded separately from Hugging Face.
@@ -29,8 +31,16 @@ Inputs:
 | `device` | `auto`, `cuda`, `cpu`, or `mps`. NVIDIA CUDA is the recommended path. |
 | `dtype` | `auto`, `bfloat16`, `float16`, or `float32`. `auto` selects an appropriate dtype for the device. |
 | `attention` | `sdpa`, `auto`, or `eager`. SDPA is the broadly compatible default. |
+| `use_batch_runtime` | Uses the official hybrid batch runtime from the model snapshot when available. Best for multi-frame batches on supported NVIDIA GPUs. |
+| `runtime_attention` | Attention backend for the optional official batch runtime. `la_flash` is the upstream fast path. |
+| `vision_attention` | Vision attention backend for the optional official batch runtime. |
+| `scheduler` | Hybrid scheduler used by the official batch runtime. |
+| `group_size` | Optional hybrid group size for the upstream batch runtime. |
+| `strict_attn` | If enabled, the batch runtime refuses backend fallback and requires the configured attention mode. |
 
 The official checkpoint requires `trust_remote_code=True`. Loading it executes Python modeling files shipped in the Hugging Face model repository.
+
+The node patches known API mismatches between the released model code and current `transformers` versions at load time. This keeps the integration working without editing the Hugging Face cache manually.
 
 ### LocateAnything Grounding
 
@@ -68,8 +78,9 @@ Generation parameters:
 | --- | --- |
 | `generation_mode` | `hybrid`, `fast`, or `slow`. See the table below. |
 | `max_new_tokens` | Maximum generated tokens. Increase for dense detections; reduce for short grounding responses. |
-| `temperature` | Sampling randomness. Use `0` for deterministic grounding. |
+| `temperature` | Sampling temperature. `0.0` is the safest path in this node. If a higher temperature fails, the node automatically retries with safe sampling settings. |
 | `top_p` | Nucleus sampling cutoff. Relevant when `temperature` is above `0`. |
+| `top_k` | Top-k sampling cutoff. `0` disables top-k, matching the upstream worker. |
 | `repetition_penalty` | Penalty for repeated tokens. The official worker uses `1.1`. |
 | `point_radius` | Radius in pixels used when points are drawn into the output mask. |
 | `mask_grow` | Grow rectangular or circular masks by this many pixels. Negative values shrink them. |
@@ -78,6 +89,12 @@ Generation parameters:
 | `overlay_opacity` | Opacity of the colored overlay preview. |
 | `seed` | Sampling seed. Relevant when `temperature` is above `0`. For batches, frame N uses `seed + N`. |
 | `verbose` | Prints the official step-by-step generation log in the terminal. Disable it for quieter runs. |
+
+Stability behavior:
+
+- If sampling with `temperature > 0` throws during generation, the node retries automatically with `temperature=0.0`, `top_p=1.0`, and `top_k=0`.
+- If a non-`custom` task returns no coordinates, the node retries once with `generation_mode="slow"` before giving up.
+- If the optional upstream batch runtime is unavailable or unsuitable for the current request, the node falls back to serial inference.
 
 Mask geometry note: LocateAnything is a grounding model, not a segmentation model. Boxes generate rectangular masks and points generate circular masks. `mask_grow` and `mask_blur` modify these shapes but do not extract object silhouettes. Connect a segmentation node such as SAM downstream when a contour mask is required.
 
@@ -127,11 +144,25 @@ For an initial test:
 task: ground_multi
 query: person
 generation_mode: hybrid
+temperature: 0.0
+top_k: 0
+```
+
+If a simple `ground_multi` prompt still fails to produce coordinates, try:
+
+```text
+task: ground_multi
+query: person
+generation_mode: slow
+temperature: 0.0
+top_p: 1.0
+top_k: 0
 ```
 
 ## Performance Notes
 
 - The official model card recommends `generation_mode="hybrid"` and up to `max_new_tokens=8192` to avoid truncating dense responses.
+- The optional upstream batch runtime requires the newer Hugging Face snapshot files such as `batch_utils/` and `kernel_utils/`. If they are not present, disable `use_batch_runtime`.
 - Without optional [MagiAttention](https://sandai-org.github.io/MagiAttention/docs/main/user_guide/install.html), the checkpoint falls back to PyTorch SDPA. This remains functional but may be slower for MTP decoding.
 - The model card documents optimized NVIDIA GPU execution. CPU execution is exposed for compatibility but will be substantially slower.
 

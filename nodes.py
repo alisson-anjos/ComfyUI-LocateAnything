@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -116,6 +118,109 @@ def _resolve_dtype(dtype: str, device: torch.device) -> torch.dtype:
     return torch.float32
 
 
+def _load_batch_runtime(
+    model_path: str,
+    attn: str,
+    vision_attn: str,
+    scheduler: str,
+    group_size: int,
+    strict_attn: bool,
+):
+    os.environ["LA_FLASH_MODEL"] = model_path
+    os.environ["LA_FLASH_ATTN"] = attn
+    os.environ["LA_FLASH_VISION_ATTN"] = vision_attn
+    os.environ["LA_FLASH_HYBRID_SCHEDULER"] = scheduler
+    os.environ["LA_FLASH_HYBRID_GROUP_SIZE"] = str(group_size)
+    if strict_attn:
+        os.environ["LA_FLASH_STRICT_ATTN"] = "1"
+    else:
+        os.environ.pop("LA_FLASH_STRICT_ATTN", None)
+
+    if model_path not in sys.path:
+        sys.path.insert(0, model_path)
+
+    try:
+        from batch_utils import generate_batch_hybrid, get_last_hybrid_stats, load
+    except ImportError as exc:
+        raise ImportError(
+            "Batch inference requires the Hugging Face release files `batch_utils/` and "
+            "`kernel_utils/` from nvidia/LocateAnything-3B. Update the local snapshot or "
+            "disable use_batch_runtime."
+        ) from exc
+
+    tokenizer, processor, model = load()
+    return tokenizer, processor, model, generate_batch_hybrid, get_last_hybrid_stats
+
+
+def _replace_once(content: str, old: str, new: str, path: Path) -> tuple[str, bool]:
+    if old not in content:
+        return content, False
+    return content.replace(old, new, 1), True
+
+
+def _apply_model_compat_patches(model_path: str) -> None:
+    root = Path(model_path)
+    if not root.is_dir():
+        return
+
+    replacements = {
+        "configuration_locateanything.py": [
+            (
+                """        if text_config['architectures'][0] == 'Qwen2ForCausalLM':\n            self.text_config = Qwen2Config(**text_config)\n        elif text_config['architectures'][0] == 'Qwen3ForCausalLM':\n            self.text_config = Qwen3Config(**text_config)\n        else:\n            raise ValueError('Unsupported architecture: {}. Only Qwen2ForCausalLM and Qwen3ForCausalLM are supported.'.format(text_config['architectures'][0]))\n        self.use_backbone_lora = use_backbone_lora\n""",
+                """        if text_config['architectures'][0] == 'Qwen2ForCausalLM':\n            self.text_config = Qwen2Config(**text_config)\n        elif text_config['architectures'][0] == 'Qwen3ForCausalLM':\n            self.text_config = Qwen3Config(**text_config)\n        else:\n            raise ValueError('Unsupported architecture: {}. Only Qwen2ForCausalLM and Qwen3ForCausalLM are supported.'.format(text_config['architectures'][0]))\n        if 'rope_theta' in text_config and not hasattr(self.text_config, 'rope_theta'):\n            self.text_config.rope_theta = text_config['rope_theta']\n        self.use_backbone_lora = use_backbone_lora\n""",
+            ),
+        ],
+        "modeling_qwen2.py": [
+            (
+                """    def _check_and_adjust_attn_implementation(self, attn_implementation, is_init_check=False):\n        if attn_implementation == "magi":\n            return "magi"\n        return super()._check_and_adjust_attn_implementation(attn_implementation, is_init_check)\n""",
+                """    def _check_and_adjust_attn_implementation(\n        self,\n        attn_implementation,\n        is_init_check=False,\n        allow_all_kernels=False,\n    ):\n        if attn_implementation == "magi":\n            return "magi"\n        return super()._check_and_adjust_attn_implementation(\n            attn_implementation,\n            is_init_check,\n            allow_all_kernels=allow_all_kernels,\n        )\n""",
+            ),
+            (
+                """        if use_cache:\n            use_legacy_cache = not isinstance(past_key_values, Cache)\n            if use_legacy_cache:\n                if past_key_values is None:\n                    past_key_values = DynamicCache()\n                else:\n                    past_key_values = DynamicCache.from_legacy_cache(past_key_values)\n            past_key_values_length = past_key_values.get_seq_length()\n""",
+                """        if use_cache:\n            use_legacy_cache = not isinstance(past_key_values, Cache)\n            if use_legacy_cache:\n                if past_key_values is None:\n                    past_key_values = DynamicCache()\n                else:\n                    if hasattr(DynamicCache, "from_legacy_cache"):\n                        past_key_values = DynamicCache.from_legacy_cache(past_key_values)\n                    else:\n                        past_key_values = DynamicCache(past_key_values)\n            past_key_values_length = past_key_values.get_seq_length()\n""",
+            ),
+            (
+                """        if use_cache:\n            use_legacy_cache = not isinstance(past_key_values, Cache)\n            if use_legacy_cache:\n                if past_key_values is None:\n                    past_key_values = DynamicCache()\n                else:\n                    if hasattr(DynamicCache, "from_legacy_cache"):\n                        past_key_values = DynamicCache.from_legacy_cache(past_key_values)\n                    else:\n                        past_key_values = DynamicCache(past_key_values)\n                        past_key_values = DynamicCache(past_key_values)\n                    else:\n                        past_key_values = DynamicCache(past_key_values)\n                    else:\n                        past_key_values = DynamicCache(past_key_values)\n            past_key_values_length = past_key_values.get_seq_length()\n""",
+                """        if use_cache:\n            use_legacy_cache = not isinstance(past_key_values, Cache)\n            if use_legacy_cache:\n                if past_key_values is None:\n                    past_key_values = DynamicCache()\n                else:\n                    if hasattr(DynamicCache, "from_legacy_cache"):\n                        past_key_values = DynamicCache.from_legacy_cache(past_key_values)\n                    else:\n                        past_key_values = DynamicCache(past_key_values)\n            past_key_values_length = past_key_values.get_seq_length()\n""",
+            ),
+            (
+                """            next_cache = next_decoder_cache.to_legacy_cache() if use_legacy_cache else next_decoder_cache\n""",
+                """            if use_legacy_cache:\n                if hasattr(next_decoder_cache, "to_legacy_cache"):\n                    next_cache = next_decoder_cache.to_legacy_cache()\n                else:\n                    next_cache = tuple((layer.keys, layer.values) for layer in next_decoder_cache.layers)\n            else:\n                next_cache = next_decoder_cache\n""",
+            ),
+            (
+                """class Qwen2ForCausalLM(Qwen2PreTrainedModel):\n    _tied_weights_keys = ["lm_head.weight"]\n""",
+                """class Qwen2ForCausalLM(Qwen2PreTrainedModel):\n    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}\n""",
+            ),
+        ],
+        "modeling_locateanything.py": [
+            (
+                """    def _check_and_adjust_attn_implementation(self, attn_implementation, is_init_check=False):\n        if attn_implementation == "magi":\n            return "magi"\n        return super()._check_and_adjust_attn_implementation(attn_implementation, is_init_check)\n""",
+                """    def _check_and_adjust_attn_implementation(\n        self,\n        attn_implementation,\n        is_init_check=False,\n        allow_all_kernels=False,\n    ):\n        if attn_implementation == "magi":\n            return "magi"\n        return super()._check_and_adjust_attn_implementation(\n            attn_implementation,\n            is_init_check,\n            allow_all_kernels=allow_all_kernels,\n        )\n""",
+            ),
+            (
+                """        if 'Qwen3' in arch:\n            self._no_split_modules = ["Qwen3DecoderLayer"]\n        else:\n            self._no_split_modules = ["Qwen2DecoderLayer"]\n\n        \n""",
+                """        if 'Qwen3' in arch:\n            self._no_split_modules = ["Qwen3DecoderLayer"]\n        else:\n            self._no_split_modules = ["Qwen2DecoderLayer"]\n\n        self.post_init()\n\n""",
+            ),
+        ],
+    }
+
+    patched_files = []
+    for filename, file_replacements in replacements.items():
+        path = root / filename
+        if not path.exists():
+            continue
+        content = path.read_text()
+        original = content
+        for old, new in file_replacements:
+            content, _ = _replace_once(content, old, new, path)
+        if content != original:
+            path.write_text(content)
+            patched_files.append(filename)
+
+    if patched_files:
+        print(f"[LocateAnything] Applied transformers compatibility patches to {', '.join(patched_files)}")
+
+
 def _tensor_to_pil(image: torch.Tensor) -> Image.Image:
     array = image.detach().cpu().clamp(0, 1).numpy()
     return Image.fromarray(np.rint(array * 255.0).astype(np.uint8), mode="RGB")
@@ -173,12 +278,23 @@ def parse_locations(answer: str, width: int, height: int) -> dict[str, Any]:
     }
 
 
+def _is_degenerate_answer(answer: str) -> bool:
+    stripped = answer.strip()
+    if len(stripped) < 32:
+        return False
+    if re.fullmatch(r"!+", stripped):
+        return True
+    if len(set(stripped)) == 1 and not stripped[0].isalnum():
+        return True
+    return False
+
+
 def _build_prompt(task: str, query: str) -> str:
     phrase = query.strip()
     prompts = {
         "ground_multi": f"Locate all the instances that match the following description: {phrase}.",
         "ground_single": f"Locate a single instance that matches the following description: {phrase}.",
-        "detect": f"Locate all the instances that match the following description: {phrase}.",
+        "detect": f"Locate all the instances that matches the following description: {phrase}.",
         "ground_text": f"Please locate the text referred as {phrase}.",
         "detect_text": "Detect all the text in box format.",
         "gui_box": f"Locate the region that matches the following description: {phrase}.",
@@ -285,6 +401,11 @@ class LocateAnythingRuntime:
     device: torch.device
     dtype: torch.dtype
     model_path: str
+    use_batch_runtime: bool = False
+    scheduler: str = "pipeline"
+    group_size: int = 0
+    batch_generate: Any = None
+    batch_stats: Any = None
 
     @torch.no_grad()
     def predict(
@@ -295,6 +416,7 @@ class LocateAnythingRuntime:
         max_new_tokens: int,
         temperature: float,
         top_p: float,
+        top_k: int,
         repetition_penalty: float,
         seed: int,
         verbose: bool,
@@ -321,26 +443,53 @@ class LocateAnythingRuntime:
             return_tensors="pt",
         ).to(self.device)
 
-        started = time.perf_counter()
-        cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
-        with torch.random.fork_rng(devices=cuda_devices):
-            torch.manual_seed(seed)
-            response = self.model.generate(
-                pixel_values=inputs["pixel_values"].to(self.dtype),
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                image_grid_hws=inputs.get("image_grid_hws"),
-                tokenizer=self.tokenizer,
-                max_new_tokens=max_new_tokens,
-                use_cache=True,
-                generation_mode=generation_mode,
-                temperature=temperature,
-                do_sample=temperature > 0,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                verbose=verbose,
+        effective_temperature = temperature
+        effective_top_p = top_p
+        effective_top_k = top_k
+        if self.device.type == "cuda" and temperature > 0:
+            print(
+                "[LocateAnything] temperature > 0 is unstable on this CUDA path and can trigger "
+                "device-side asserts in multinomial sampling. Forcing safe sampling with "
+                "temperature=0.0, top_p=1.0, top_k=0."
             )
-        elapsed = time.perf_counter() - started
+            effective_temperature = 0.0
+            effective_top_p = 1.0
+            effective_top_k = 0
+
+        def _generate_once(run_temperature: float, run_top_p: float, run_top_k: int):
+            started = time.perf_counter()
+            cuda_devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+            with torch.random.fork_rng(devices=cuda_devices):
+                torch.manual_seed(seed)
+                top_k_for_generate = None if run_top_k <= 0 else run_top_k
+                response = self.model.generate(
+                    pixel_values=inputs["pixel_values"].to(self.dtype),
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    image_grid_hws=inputs.get("image_grid_hws"),
+                    tokenizer=self.tokenizer,
+                    max_new_tokens=max_new_tokens,
+                    use_cache=True,
+                    generation_mode=generation_mode,
+                    temperature=run_temperature,
+                    do_sample=run_temperature > 0,
+                    top_p=run_top_p,
+                    top_k=top_k_for_generate,
+                    repetition_penalty=repetition_penalty,
+                    verbose=verbose,
+                )
+            return response, time.perf_counter() - started
+
+        try:
+            response, elapsed = _generate_once(effective_temperature, effective_top_p, effective_top_k)
+        except Exception as exc:
+            if effective_temperature <= 0:
+                raise
+            print(
+                "[LocateAnything] Sampling path failed; retrying with temperature=0.0, top_p=1.0, top_k=0. "
+                f"Original error: {exc}"
+            )
+            response, elapsed = _generate_once(0.0, 1.0, 0)
 
         payload = response[0] if isinstance(response, tuple) else response
         if isinstance(payload, str):
@@ -358,10 +507,102 @@ class LocateAnythingRuntime:
             result["stats"] = response[2]
         return result
 
+    @torch.no_grad()
+    def predict_batch(
+        self,
+        images: list[Image.Image],
+        prompt: str,
+        generation_mode: str,
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        repetition_penalty: float,
+        verbose: bool,
+    ) -> list[dict[str, Any]]:
+        if not self.use_batch_runtime or self.batch_generate is None:
+            return [
+                self.predict(
+                    image=image,
+                    prompt=prompt,
+                    generation_mode=generation_mode,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    seed=index,
+                    verbose=verbose,
+                )
+                for index, image in enumerate(images)
+            ]
+
+        if generation_mode != "hybrid":
+            raise ValueError("Batch runtime currently supports generation_mode='hybrid' only")
+
+        effective_temperature = temperature
+        effective_top_p = top_p
+        effective_top_k = top_k
+        if self.device.type == "cuda" and temperature > 0:
+            print(
+                "[LocateAnything] temperature > 0 is unstable on this CUDA batch path and can trigger "
+                "device-side asserts in multinomial sampling. Forcing safe sampling with "
+                "temperature=0.0, top_p=1.0, top_k=0."
+            )
+            effective_temperature = 0.0
+            effective_top_p = 1.0
+            effective_top_k = 0
+
+        top_k_for_generate = None if effective_top_k <= 0 else effective_top_k
+        top_p_for_generate = None if effective_top_p < 0 else effective_top_p
+        try:
+            answers = self.batch_generate(
+                [(image, prompt) for image in images],
+                temperature=effective_temperature,
+                top_p=top_p_for_generate,
+                top_k=top_k_for_generate,
+                repetition_penalty=repetition_penalty,
+                max_new_tokens=max_new_tokens,
+                scheduler=self.scheduler,
+                group_size=self.group_size,
+            )
+        except Exception as exc:
+            if effective_temperature <= 0:
+                raise
+            print(
+                "[LocateAnything] Batch sampling path failed; retrying serially with temperature=0.0, "
+                f"top_p=1.0, top_k=0. Original error: {exc}"
+            )
+            return [
+                self.predict(
+                    image=image,
+                    prompt=prompt,
+                    generation_mode=generation_mode,
+                    max_new_tokens=max_new_tokens,
+                    temperature=0.0,
+                    top_p=1.0,
+                    top_k=0,
+                    repetition_penalty=repetition_penalty,
+                    seed=index,
+                    verbose=verbose,
+                )
+                for index, image in enumerate(images)
+            ]
+        stats = self.batch_stats() if verbose and self.batch_stats is not None else None
+        results = []
+        for answer in answers:
+            row = {"answer": answer, "elapsed_seconds": 0.0}
+            if stats is not None:
+                row["stats"] = stats
+            results.append(row)
+        return results
+
     def unload(self) -> None:
         self.model = None
         self.tokenizer = None
         self.processor = None
+        self.batch_generate = None
+        self.batch_stats = None
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -392,10 +633,54 @@ class LocateAnythingModelLoader:
                     {"default": "auto", "tooltip": "Model precision. auto selects bfloat16 or float16 on CUDA and float32 on CPU."},
                 ),
                 "attention": (
-                    ["sdpa", "auto", "eager"],
+                    ["eager", "sdpa", "auto"],
                     {
-                        "default": "sdpa",
-                        "tooltip": "SDPA is the stable choice for GPUs without MagiAttention.",
+                        "default": "eager",
+                        "tooltip": "Eager is the conservative compatibility path. SDPA can be faster but may be less stable on some setups.",
+                    },
+                ),
+                "use_batch_runtime": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Use the official hybrid batch runtime from the model snapshot when available.",
+                    },
+                ),
+                "runtime_attention": (
+                    ["la_flash", "sdpa", "eager", "auto"],
+                    {
+                        "default": "la_flash",
+                        "tooltip": "Attention backend for the optional official batch runtime.",
+                    },
+                ),
+                "vision_attention": (
+                    ["auto", "sdpa", "eager", "flash_attention_2"],
+                    {
+                        "default": "auto",
+                        "tooltip": "Vision attention backend for the optional official batch runtime.",
+                    },
+                ),
+                "scheduler": (
+                    ["pipeline", "round_robin"],
+                    {
+                        "default": "pipeline",
+                        "tooltip": "Hybrid batch scheduler used by the official batch runtime.",
+                    },
+                ),
+                "group_size": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 1024,
+                        "tooltip": "Batch runtime hybrid grouping. 0 keeps the upstream default.",
+                    },
+                ),
+                "strict_attn": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Require the configured batch attention backend instead of allowing runtime fallback.",
                     },
                 ),
             }
@@ -415,6 +700,12 @@ class LocateAnythingModelLoader:
         device: str,
         dtype: str,
         attention: str,
+        use_batch_runtime: bool,
+        runtime_attention: str,
+        vision_attention: str,
+        scheduler: str,
+        group_size: int,
+        strict_attn: bool,
     ):
         from transformers import AutoModel, AutoProcessor, AutoTokenizer
 
@@ -430,11 +721,24 @@ class LocateAnythingModelLoader:
 
         print(
             f"[LocateAnything] Loading {model_path} on {torch_device} "
-            f"with {torch_dtype} and attention={attention}"
+            f"with {torch_dtype}, attention={attention}, use_batch_runtime={use_batch_runtime}"
         )
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-        model = AutoModel.from_pretrained(model_path, **kwargs).to(torch_device).eval()
+        _apply_model_compat_patches(model_path)
+        batch_generate = None
+        batch_stats = None
+        if use_batch_runtime:
+            tokenizer, processor, model, batch_generate, batch_stats = _load_batch_runtime(
+                model_path=model_path,
+                attn=runtime_attention,
+                vision_attn=vision_attention,
+                scheduler=scheduler,
+                group_size=group_size,
+                strict_attn=strict_attn,
+            )
+        else:
+            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+            model = AutoModel.from_pretrained(model_path, **kwargs).to(torch_device).eval()
         return (
             LocateAnythingRuntime(
                 model=model,
@@ -443,6 +747,11 @@ class LocateAnythingModelLoader:
                 device=torch_device,
                 dtype=torch_dtype,
                 model_path=model_path,
+                use_batch_runtime=use_batch_runtime,
+                scheduler=scheduler,
+                group_size=group_size,
+                batch_generate=batch_generate,
+                batch_stats=batch_stats,
             ),
         )
 
@@ -473,9 +782,10 @@ class LocateAnythingGrounding:
                 "max_new_tokens": ("INT", {"default": 2048, "min": 1, "max": 8192, "tooltip": "Maximum generated tokens. Reduce this when shorter answers are sufficient."}),
                 "temperature": (
                     "FLOAT",
-                    {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Sampling randomness. Keep 0 for deterministic grounding."},
+                    {"default": 0.0, "min": 0.0, "max": 2.0, "step": 0.05, "tooltip": "Sampling temperature. 0.0 is the safest path; the node retries with safe settings if higher temperatures fail."},
                 ),
                 "top_p": ("FLOAT", {"default": 0.9, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Nucleus sampling cutoff. Relevant when temperature is above 0."}),
+                "top_k": ("INT", {"default": 0, "min": 0, "max": 1024, "tooltip": "Top-k sampling cutoff. 0 disables top-k, matching the official worker."}),
                 "repetition_penalty": (
                     "FLOAT",
                     {"default": 1.1, "min": 0.0, "max": 3.0, "step": 0.05, "tooltip": "Penalty for repeated tokens. The official worker uses 1.1."},
@@ -526,6 +836,7 @@ Coordinates are parsed from the model's normalized [0, 1000] format. A batch of 
         max_new_tokens: int,
         temperature: float,
         top_p: float,
+        top_k: int,
         repetition_penalty: float,
         point_radius: int,
         mask_grow: int,
@@ -542,23 +853,84 @@ Coordinates are parsed from the model's normalized [0, 1000] format. A batch of 
         masks = []
         mask_overlays = []
         color = _parse_overlay_color(overlay_color)
-        progress_bar = comfy.utils.ProgressBar(len(image))
+        frames = list(image)
+        pil_images = [_tensor_to_pil(frame) for frame in frames]
+        progress_bar = comfy.utils.ProgressBar(len(frames))
+        frame_seeds = [((seed + index) & 0xffffffffffffffff) for index in range(len(frames))]
 
-        for index, frame in enumerate(image):
-            frame_seed = (seed + index) & 0xffffffffffffffff
-            pil_image = _tensor_to_pil(frame)
-            result = model.predict(
-                image=pil_image,
+        if model.use_batch_runtime and len(pil_images) > 1:
+            results = model.predict_batch(
+                images=pil_images,
                 prompt=prompt,
                 generation_mode=generation_mode,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 repetition_penalty=repetition_penalty,
-                seed=frame_seed,
                 verbose=verbose,
             )
+        else:
+            results = [
+                model.predict(
+                    image=pil_image,
+                    prompt=prompt,
+                    generation_mode=generation_mode,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
+                    seed=frame_seed,
+                    verbose=verbose,
+                )
+                for pil_image, frame_seed in zip(pil_images, frame_seeds, strict=True)
+            ]
+
+        for index, (frame, pil_image, frame_seed, result) in enumerate(
+            zip(frames, pil_images, frame_seeds, results, strict=True)
+        ):
+            if _is_degenerate_answer(result["answer"]):
+                print(
+                    "[LocateAnything] Degenerate repeated-token output detected; retrying once with generation_mode=slow."
+                )
+                result = model.predict(
+                    image=pil_image,
+                    prompt=prompt,
+                    generation_mode="slow",
+                    max_new_tokens=min(max_new_tokens, 1024),
+                    temperature=0.0,
+                    top_p=1.0,
+                    top_k=0,
+                    repetition_penalty=repetition_penalty,
+                    seed=frame_seed,
+                    verbose=verbose,
+                )
             locations = parse_locations(result["answer"], *pil_image.size)
+            if not locations["boxes"] and not locations["points"] and not locations["none"]:
+                if task != "custom" and generation_mode != "slow":
+                    print(
+                        "[LocateAnything] No coordinates parsed in current mode; retrying once with generation_mode=slow."
+                    )
+                    result = model.predict(
+                        image=pil_image,
+                        prompt=prompt,
+                        generation_mode="slow",
+                        max_new_tokens=max_new_tokens,
+                        temperature=0.0,
+                        top_p=1.0,
+                        top_k=0,
+                        repetition_penalty=repetition_penalty,
+                        seed=frame_seed,
+                        verbose=verbose,
+                    )
+                    locations = parse_locations(result["answer"], *pil_image.size)
+                if not locations["boxes"] and not locations["points"] and not locations["none"]:
+                    print(
+                        "[LocateAnything] No coordinates parsed from model response. "
+                        "Try reloading the model with attention=eager, then use generation_mode=slow. "
+                        f"Raw answer: {result['answer']!r}"
+                    )
             annotated, mask = _draw_locations(pil_image, locations, point_radius)
             mask = _postprocess_mask(mask, mask_grow, mask_blur)
             answers.append(result["answer"])

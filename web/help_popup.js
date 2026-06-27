@@ -18,9 +18,17 @@ const HELP_CONTENT = {
       <tr><td><code>device</code></td><td><code>auto</code> follows ComfyUI. CUDA is recommended when available.</td></tr>
       <tr><td><code>dtype</code></td><td><code>auto</code> chooses BF16 or FP16 on CUDA and FP32 on CPU.</td></tr>
       <tr><td><code>attention</code></td><td><code>sdpa</code> is the broadly compatible default. Without optional MagiAttention, the official model falls back to SDPA.</td></tr>
+      <tr><td><code>use_batch_runtime</code></td><td>Uses the official hybrid batch runtime from the upstream model snapshot when available.</td></tr>
+      <tr><td><code>runtime_attention</code></td><td>Attention backend for the optional upstream batch runtime. <code>la_flash</code> is the upstream fast path.</td></tr>
+      <tr><td><code>vision_attention</code></td><td>Vision attention backend for the optional upstream batch runtime.</td></tr>
+      <tr><td><code>scheduler</code></td><td>Hybrid scheduler used by the optional upstream batch runtime.</td></tr>
+      <tr><td><code>group_size</code></td><td>Optional hybrid group size used by the upstream batch runtime.</td></tr>
+      <tr><td><code>strict_attn</code></td><td>Require the configured batch attention backend instead of allowing runtime fallback.</td></tr>
     </table>
     <h3>Security Note</h3>
     <p>The official checkpoint requires <code>trust_remote_code=True</code>. Loading it executes modeling Python files shipped with the Hugging Face repository.</p>
+    <h3>Compatibility Note</h3>
+    <p>The node applies runtime compatibility patches to the model snapshot so it can work with current <code>transformers</code> releases without manual cache edits.</p>
   `,
   LocateAnythingGrounding: `
     <h2>LocateAnything Grounding</h2>
@@ -52,8 +60,9 @@ const HELP_CONTENT = {
       <tr><th>Parameter</th><th>Description</th></tr>
       <tr><td><code>query</code></td><td>Description, category list, text phrase, GUI target, or complete prompt in custom mode.</td></tr>
       <tr><td><code>max_new_tokens</code></td><td>Maximum generated tokens. Increase for dense detections. The official model card recommends up to 8192 to avoid truncation.</td></tr>
-      <tr><td><code>temperature</code></td><td>Sampling randomness. Use 0 for deterministic grounding.</td></tr>
+      <tr><td><code>temperature</code></td><td>Sampling temperature. <code>0.0</code> is the safest path. If higher temperatures fail, the node retries with safe sampling settings automatically.</td></tr>
       <tr><td><code>top_p</code></td><td>Nucleus sampling cutoff. Relevant when temperature is above 0.</td></tr>
+      <tr><td><code>top_k</code></td><td>Top-k sampling cutoff. <code>0</code> disables top-k, matching the upstream worker.</td></tr>
       <tr><td><code>repetition_penalty</code></td><td>Penalty for repeated tokens. The official worker uses 1.1.</td></tr>
       <tr><td><code>point_radius</code></td><td>Radius in pixels used to draw point results into the mask.</td></tr>
       <tr><td><code>mask_grow</code></td><td>Grow rectangular or circular masks by this many pixels. Negative values shrink them.</td></tr>
@@ -63,6 +72,8 @@ const HELP_CONTENT = {
       <tr><td><code>seed</code></td><td>Sampling seed. Relevant when temperature is above 0. For IMAGE batches, frame N uses <code>seed + N</code> for reproducible frame-by-frame processing.</td></tr>
       <tr><td><code>verbose</code></td><td>Print the official step-by-step generation log in the terminal. Disable for quieter runs.</td></tr>
     </table>
+    <h3>Stability</h3>
+    <p>If sampling with <code>temperature &gt; 0</code> fails, the node retries automatically with <code>temperature=0.0</code>, <code>top_p=1.0</code>, and <code>top_k=0</code>. If a non-custom task returns no coordinates, it retries once in <code>slow</code> mode.</p>
     <h3>Mask Geometry</h3>
     <p>LocateAnything is a grounding model, not a segmentation model. Box results produce rectangular masks and point results produce circular masks. Grow and blur expand or soften those shapes; they do not extract an object silhouette. Use a segmentation node such as SAM downstream when silhouette masks are required.</p>
     <h3>Outputs</h3>
